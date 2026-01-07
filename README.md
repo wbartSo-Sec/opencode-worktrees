@@ -1,0 +1,3 @@
+# opencode-worktree
+
+Initializing...
