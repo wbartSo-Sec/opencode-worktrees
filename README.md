@@ -212,6 +212,10 @@ This plugin is part of the [KDCO Registry](https://github.com/kdcokenny/ocx/tree
 - [opencode-background-agents](https://github.com/kdcokenny/opencode-background-agents) - Async delegation with persistent outputs
 - [opencode-notify](https://github.com/kdcokenny/opencode-notify) - Native OS notifications
 
+## Acknowledgments
+
+This plugin was inspired by [opencode-worktree-session](https://github.com/felixAnhalt/opencode-worktree-session) by Felix Anhalt.
+
 ## License
 
 MIT
