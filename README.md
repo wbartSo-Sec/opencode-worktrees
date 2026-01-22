@@ -57,6 +57,8 @@ ocx registry add --name kdco https://registry.kdco.dev
 ocx add kdco/worktree
 ```
 
+> **Tip:** Add `--global` to configure the registry globally instead of per-project.
+
 Want the full experience? Install `kdco-workspace` instead—it bundles worktrees with background agents, planning tools, and notifications:
 
 ```bash
