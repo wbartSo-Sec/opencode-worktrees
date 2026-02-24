@@ -22,7 +22,7 @@ bun run src/cli/worktree-sets.ts create \
 Add to your shell config (`~/.zshrc` or `~/.bashrc`):
 
 ```bash
-alias worktree-sets='bun run /Users/willbartlett/sai/tools/opencode-worktrees/src/cli/worktree-sets.ts'
+alias worktree-sets='bun run /Path/To/opencode-worktrees/src/cli/worktree-sets.ts'
 ```
 
 Reload: `source ~/.zshrc`
