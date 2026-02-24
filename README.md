@@ -1,3 +1,5 @@
+**Not affliated with the OpenCode team.**
+
 # Multi-Repo Worktree Management
 
 > Internal tool for managing git worktrees across multiple repositories simultaneously.
