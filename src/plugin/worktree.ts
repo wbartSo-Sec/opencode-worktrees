@@ -18,19 +18,22 @@ import * as path from "node:path"
 import { type Plugin, tool } from "@opencode-ai/plugin"
 import type { Event } from "@opencode-ai/sdk"
 import type { OpencodeClient } from "./kdco-primitives/types"
-
-/** Logger interface for structured logging */
-interface Logger {
-	debug: (msg: string) => void
-	info: (msg: string) => void
-	warn: (msg: string) => void
-	error: (msg: string) => void
-}
-
 import { parse as parseJsonc } from "jsonc-parser"
 import { z } from "zod"
 
 import { getProjectId } from "./kdco-primitives/get-project-id"
+import type { Logger, Result } from "./worktree/shared"
+import {
+	Result as ResultHelper,
+	WorktreeError,
+	branchExists,
+	branchNameSchema,
+	copyFiles,
+	git,
+	loadWorktreeConfig,
+	runHooks,
+	symlinkDirs,
+} from "./worktree/shared"
 import {
 	addSession,
 	clearPendingDelete,
@@ -42,6 +45,9 @@ import {
 	setPendingDelete,
 } from "./worktree/state"
 import { openTerminal } from "./worktree/terminal"
+import { createWorktreeSet, listWorktreeSets, removeWorktreeSet } from "./worktree/multi-repo/sets"
+import { loadPreset } from "./worktree/multi-repo/config"
+import { findWorkspaceRoot, validateRepos } from "./worktree/multi-repo/discovery"
 
 /** Maximum retries for database initialization */
 const DB_MAX_RETRIES = 3
@@ -51,110 +57,6 @@ const DB_RETRY_DELAY_MS = 100
 
 /** Maximum depth to traverse session parent chain */
 const MAX_SESSION_CHAIN_DEPTH = 10
-
-// =============================================================================
-// TYPES & SCHEMAS
-// =============================================================================
-
-/** Result type for fallible operations */
-interface OkResult<T> {
-	readonly ok: true
-	readonly value: T
-}
-interface ErrResult<E> {
-	readonly ok: false
-	readonly error: E
-}
-type Result<T, E> = OkResult<T> | ErrResult<E>
-
-const Result = {
-	ok: <T>(value: T): OkResult<T> => ({ ok: true, value }),
-	err: <E>(error: E): ErrResult<E> => ({ ok: false, error }),
-}
-
-/**
- * Git branch name validation - blocks invalid refs and shell metacharacters
- * Characters blocked: control chars (0x00-0x1f, 0x7f), ~^:?*[]\\, and shell metacharacters
- */
-function isValidBranchName(name: string): boolean {
-	// Check for control characters
-	for (let i = 0; i < name.length; i++) {
-		const code = name.charCodeAt(i)
-		if (code <= 0x1f || code === 0x7f) return false
-	}
-	// Check for invalid git ref characters and shell metacharacters
-	if (/[~^:?*[\]\\;&|`$()]/.test(name)) return false
-	return true
-}
-
-const branchNameSchema = z
-	.string()
-	.min(1, "Branch name cannot be empty")
-	.refine((name) => !name.startsWith("-"), {
-		message: "Branch name cannot start with '-' (prevents option injection)",
-	})
-	.refine((name) => !name.startsWith("/") && !name.endsWith("/"), {
-		message: "Branch name cannot start or end with '/'",
-	})
-	.refine((name) => !name.includes("//"), {
-		message: "Branch name cannot contain '//'",
-	})
-	.refine((name) => !name.includes("@{"), {
-		message: "Branch name cannot contain '@{' (git reflog syntax)",
-	})
-	.refine((name) => !name.includes(".."), {
-		message: "Branch name cannot contain '..'",
-	})
-	// biome-ignore lint/suspicious/noControlCharactersInRegex: Control character detection is intentional for security
-	.refine((name) => !/[\x00-\x1f\x7f ~^:?*[\]\\]/.test(name), {
-		message: "Branch name contains invalid characters",
-	})
-	.max(255, "Branch name too long")
-	.refine((name) => isValidBranchName(name), "Contains invalid git ref characters")
-	.refine((name) => !name.startsWith(".") && !name.endsWith("."), "Cannot start or end with dot")
-	.refine((name) => !name.endsWith(".lock"), "Cannot end with .lock")
-
-/**
- * Worktree plugin configuration schema.
- * Config file: .opencode/worktree.jsonc
- */
-const worktreeConfigSchema = z.object({
-	sync: z
-		.object({
-			/** Files to copy from main worktree (relative paths only) */
-			copyFiles: z.array(z.string()).default([]),
-			/** Directories to symlink from main worktree (saves disk space) */
-			symlinkDirs: z.array(z.string()).default([]),
-			/** Patterns to exclude from copying (reserved for future use) */
-			exclude: z.array(z.string()).default([]),
-		})
-		.default(() => ({ copyFiles: [], symlinkDirs: [], exclude: [] })),
-	hooks: z
-		.object({
-			/** Commands to run after worktree creation */
-			postCreate: z.array(z.string()).default([]),
-			/** Commands to run before worktree deletion */
-			preDelete: z.array(z.string()).default([]),
-		})
-		.default(() => ({ postCreate: [], preDelete: [] })),
-})
-
-type WorktreeConfig = z.infer<typeof worktreeConfigSchema>
-
-// =============================================================================
-// ERROR TYPES
-// =============================================================================
-
-class WorktreeError extends Error {
-	constructor(
-		message: string,
-		public readonly operation: string,
-		public readonly cause?: unknown,
-	) {
-		super(`${operation}: ${message}`)
-		this.name = "WorktreeError"
-	}
-}
 
 // =============================================================================
 // SESSION FORKING HELPERS
@@ -406,36 +308,6 @@ async function initDb(root: string, log: Logger): Promise<Database> {
 // GIT MODULE
 // =============================================================================
 
-/**
- * Execute a git command safely using Bun.spawn with explicit array.
- * Avoids shell interpolation entirely by passing args as array.
- */
-async function git(args: string[], cwd: string): Promise<Result<string, string>> {
-	try {
-		const proc = Bun.spawn(["git", ...args], {
-			cwd,
-			stdout: "pipe",
-			stderr: "pipe",
-		})
-		const [stdout, stderr, exitCode] = await Promise.all([
-			new Response(proc.stdout).text(),
-			new Response(proc.stderr).text(),
-			proc.exited,
-		])
-		if (exitCode !== 0) {
-			return Result.err(stderr.trim() || `git ${args[0]} failed`)
-		}
-		return Result.ok(stdout.trim())
-	} catch (error) {
-		return Result.err(error instanceof Error ? error.message : String(error))
-	}
-}
-
-async function branchExists(cwd: string, branch: string): Promise<boolean> {
-	const result = await git(["rev-parse", "--verify", branch], cwd)
-	return result.ok
-}
-
 async function createWorktree(
 	repoRoot: string,
 	branch: string,
@@ -451,12 +323,12 @@ async function createWorktree(
 	if (exists) {
 		// Checkout existing branch into worktree
 		const result = await git(["worktree", "add", worktreePath, branch], repoRoot)
-		return result.ok ? Result.ok(worktreePath) : result
+		return result.ok ? ResultHelper.ok(worktreePath) : result
 	} else {
 		// Create new branch from base
 		const base = baseBranch ?? "HEAD"
 		const result = await git(["worktree", "add", "-b", branch, worktreePath, base], repoRoot)
-		return result.ok ? Result.ok(worktreePath) : result
+		return result.ok ? ResultHelper.ok(worktreePath) : result
 	}
 }
 
@@ -465,204 +337,7 @@ async function removeWorktree(
 	worktreePath: string,
 ): Promise<Result<void, string>> {
 	const result = await git(["worktree", "remove", "--force", worktreePath], repoRoot)
-	return result.ok ? Result.ok(undefined) : Result.err(result.error)
-}
-
-// =============================================================================
-// FILE SYNC MODULE
-// =============================================================================
-
-/**
- * Validate that a path is safe (no escape from base directory)
- */
-function isPathSafe(filePath: string, baseDir: string, log: Logger): boolean {
-	// Reject absolute paths
-	if (path.isAbsolute(filePath)) {
-		log.warn(`[worktree] Rejected absolute path: ${filePath}`)
-		return false
-	}
-	// Reject obvious path traversal
-	if (filePath.includes("..")) {
-		log.warn(`[worktree] Rejected path traversal: ${filePath}`)
-		return false
-	}
-	// Verify resolved path stays within base directory
-	const resolved = path.resolve(baseDir, filePath)
-	if (!resolved.startsWith(baseDir + path.sep) && resolved !== baseDir) {
-		log.warn(`[worktree] Path escapes base directory: ${filePath}`)
-		return false
-	}
-	return true
-}
-
-/**
- * Copy files from source directory to target directory.
- * Skips missing files silently (production pattern).
- */
-async function copyFiles(
-	sourceDir: string,
-	targetDir: string,
-	files: string[],
-	log: Logger,
-): Promise<void> {
-	for (const file of files) {
-		if (!isPathSafe(file, sourceDir, log)) continue
-
-		const sourcePath = path.join(sourceDir, file)
-		const targetPath = path.join(targetDir, file)
-
-		try {
-			const sourceFile = Bun.file(sourcePath)
-			if (!(await sourceFile.exists())) {
-				log.debug(`[worktree] Skipping missing file: ${file}`)
-				continue
-			}
-
-			// Ensure target directory exists
-			const targetFileDir = path.dirname(targetPath)
-			await mkdir(targetFileDir, { recursive: true })
-
-			// Copy file
-			await Bun.write(targetPath, sourceFile)
-			log.info(`[worktree] Copied: ${file}`)
-		} catch (error) {
-			const isNotFound =
-				error instanceof Error &&
-				(error.message.includes("ENOENT") || error.message.includes("no such file"))
-			if (isNotFound) {
-				log.debug(`[worktree] Skipping missing: ${file}`)
-			} else {
-				log.warn(`[worktree] Failed to copy ${file}: ${error}`)
-			}
-		}
-	}
-}
-
-/**
- * Create symlinks for directories from source to target.
- * Uses absolute paths for symlink targets.
- */
-async function symlinkDirs(
-	sourceDir: string,
-	targetDir: string,
-	dirs: string[],
-	log: Logger,
-): Promise<void> {
-	for (const dir of dirs) {
-		if (!isPathSafe(dir, sourceDir, log)) continue
-
-		const sourcePath = path.join(sourceDir, dir)
-		const targetPath = path.join(targetDir, dir)
-
-		try {
-			// Check if source directory exists
-			const fileStat = await stat(sourcePath).catch(() => null)
-			if (!fileStat || !fileStat.isDirectory()) {
-				log.debug(`[worktree] Skipping missing directory: ${dir}`)
-				continue
-			}
-
-			// Ensure parent directory exists
-			const targetParentDir = path.dirname(targetPath)
-			await mkdir(targetParentDir, { recursive: true })
-
-			// Remove existing target if it exists (might be empty dir from git)
-			await rm(targetPath, { recursive: true, force: true })
-
-			// Create symlink (use absolute path for source)
-			await symlink(sourcePath, targetPath, "dir")
-			log.info(`[worktree] Symlinked: ${dir}`)
-		} catch (error) {
-			log.warn(`[worktree] Failed to symlink ${dir}: ${error}`)
-		}
-	}
-}
-
-/**
- * Run hook commands in the worktree directory.
- */
-async function runHooks(cwd: string, commands: string[], log: Logger): Promise<void> {
-	for (const command of commands) {
-		log.info(`[worktree] Running hook: ${command}`)
-		try {
-			// Use shell to properly handle quoted arguments and complex commands
-			const result = Bun.spawnSync(["bash", "-c", command], {
-				cwd,
-				stdout: "inherit",
-				stderr: "pipe",
-			})
-			if (result.exitCode !== 0) {
-				const stderr = result.stderr?.toString() || ""
-				log.warn(
-					`[worktree] Hook failed (exit ${result.exitCode}): ${command}${stderr ? `\n${stderr}` : ""}`,
-				)
-			}
-		} catch (error) {
-			log.warn(`[worktree] Hook error: ${error}`)
-		}
-	}
-}
-
-/**
- * Load worktree-specific configuration from .opencode/worktree.jsonc
- * Auto-creates config file with helpful defaults if it doesn't exist.
- */
-async function loadWorktreeConfig(directory: string, log: Logger): Promise<WorktreeConfig> {
-	const configPath = path.join(directory, ".opencode", "worktree.jsonc")
-
-	try {
-		const file = Bun.file(configPath)
-		if (!(await file.exists())) {
-			// Auto-create config with helpful defaults and comments
-			const defaultConfig = `{
-  "$schema": "https://registry.kdco.dev/schemas/worktree.json",
-
-  // Worktree plugin configuration
-  // Documentation: https://github.com/kdcokenny/ocx
-
-  "sync": {
-    // Files to copy from main worktree to new worktrees
-    // Example: [".env", ".env.local", "dev.sqlite"]
-    "copyFiles": [],
-
-    // Directories to symlink (saves disk space)
-    // Example: ["node_modules"]
-    "symlinkDirs": [],
-
-    // Patterns to exclude from copying
-    "exclude": []
-  },
-
-  "hooks": {
-    // Commands to run after worktree creation
-    // Example: ["pnpm install", "docker compose up -d"]
-    "postCreate": [],
-
-    // Commands to run before worktree deletion
-    // Example: ["docker compose down"]
-    "preDelete": []
-  }
-}
-`
-			// Ensure .opencode directory exists
-			await mkdir(path.join(directory, ".opencode"), { recursive: true })
-			await Bun.write(configPath, defaultConfig)
-			log.info(`[worktree] Created default config: ${configPath}`)
-			return worktreeConfigSchema.parse({})
-		}
-
-		const content = await file.text()
-		// Use proper JSONC parser (handles comments in strings correctly)
-		const parsed = parseJsonc(content)
-		if (parsed === undefined) {
-			log.error(`[worktree] Invalid worktree.jsonc syntax`)
-			return worktreeConfigSchema.parse({})
-		}
-		return worktreeConfigSchema.parse(parsed)
-	} catch (error) {
-		log.warn(`[worktree] Failed to load config: ${error}`)
-		return worktreeConfigSchema.parse({})
-	}
+	return result.ok ? ResultHelper.ok(undefined) : ResultHelper.err(result.error)
 }
 
 // =============================================================================
@@ -814,6 +489,227 @@ export const WorktreePlugin: Plugin = async (ctx) => {
 					setPendingDelete(database, { branch: session.branch, path: session.path }, client)
 
 					return `Worktree marked for cleanup. It will be removed when this session ends.`
+				},
+			}),
+
+			worktree_set_create: tool({
+				description:
+					"Create worktrees across multiple repositories under a shared feature directory. Useful for multi-repo development where you need the same feature branch checked out in several repositories simultaneously.",
+				args: {
+					branch: tool.schema
+						.string()
+						.describe("Branch name for the worktree set (e.g., 'feature/dark-mode')"),
+					repos: tool.schema
+						.array(tool.schema.string())
+						.describe("Repository names to create worktrees for (e.g., ['web', 'api', 'database'])"),
+					baseBranch: tool.schema
+						.string()
+						.optional()
+						.describe("Base branch to create from (defaults to HEAD)"),
+					preset: tool.schema
+						.string()
+						.optional()
+						.describe("Preset name to load repository list from .worktree-sets.jsonc"),
+					workspace: tool.schema
+						.string()
+						.optional()
+						.describe("Workspace root directory (auto-detected if not provided)"),
+				},
+				async execute(args, _toolCtx) {
+					// Validate branch name at boundary
+					const branchResult = branchNameSchema.safeParse(args.branch)
+					if (!branchResult.success) {
+						return `❌ Invalid branch name: ${branchResult.error.issues[0]?.message}`
+					}
+
+					// Resolve workspace root
+					let workspaceRoot: string
+					if (args.workspace) {
+						workspaceRoot = args.workspace
+					} else {
+						const wsResult = await findWorkspaceRoot(directory)
+						if (!wsResult.ok) {
+							return `❌ ${wsResult.error}`
+						}
+						workspaceRoot = wsResult.value
+					}
+
+					// Determine repository list (preset, explicit repos, or merge both)
+					let repos: string[] = []
+
+					if (args.preset) {
+						const presetResult = await loadPreset(workspaceRoot, args.preset, log)
+						if (!presetResult.ok) {
+							return `❌ ${presetResult.error}`
+						}
+						repos = presetResult.value
+					}
+
+					// Merge explicit repos with preset repos if both provided
+					if (args.repos.length > 0) {
+						repos = [...new Set([...repos, ...args.repos])]
+					}
+
+					// Validate we have repos
+					if (repos.length === 0) {
+						return `❌ No repositories specified. Provide either 'repos' or 'preset'.`
+					}
+
+					// Validate repos exist
+					const validationResult = validateRepos(workspaceRoot, repos)
+					if (!validationResult.ok) {
+						return `❌ Repository validation failed: ${validationResult.error}`
+					}
+
+					const validRepos = validationResult.value
+					if (validRepos.length === 0) {
+						return `❌ None of the specified repositories exist in ${workspaceRoot}/main/`
+					}
+
+					// Create worktree set
+					const result = await createWorktreeSet({
+						workspaceRoot,
+						branch: args.branch,
+						baseBranch: args.baseBranch,
+						repos: validRepos,
+						runHooksFlag: true,
+						log,
+					})
+
+					// Format summary
+					const summary = [
+						`✅ Worktree set created: ${result.featurePath}`,
+						``,
+						`📊 Results: ${result.successCount} succeeded, ${result.failureCount} failed`,
+						``,
+					]
+
+					if (result.successCount > 0) {
+						summary.push(`✅ Successful worktrees:`)
+						for (const res of result.results) {
+							if (res.success && res.worktreePath) {
+								summary.push(`  - ${res.repo}: ${res.worktreePath}`)
+							}
+						}
+						summary.push(``)
+					}
+
+					if (result.failureCount > 0) {
+						summary.push(`❌ Failed worktrees:`)
+						for (const res of result.results) {
+							if (!res.success && res.error) {
+								summary.push(`  - ${res.repo}: ${res.error}`)
+							}
+						}
+						summary.push(``)
+					}
+
+					if (result.successCount > 0) {
+						summary.push(`OpenCode has been launched in the feature directory.`)
+					}
+
+					return summary.join("\n")
+				},
+			}),
+
+			worktree_set_delete: tool({
+				description:
+					"Delete all worktrees in a multi-repo feature set. Removes all worktrees for the specified branch and cleans up the feature directory.",
+				args: {
+					branch: tool.schema
+						.string()
+						.describe("Branch name of the worktree set to delete (e.g., 'feature/dark-mode')"),
+					workspace: tool.schema
+						.string()
+						.optional()
+						.describe("Workspace root directory (auto-detected if not provided)"),
+				},
+				async execute(args, _toolCtx) {
+					// Resolve workspace root
+					let workspaceRoot: string
+					if (args.workspace) {
+						workspaceRoot = args.workspace
+					} else {
+						const wsResult = await findWorkspaceRoot(directory)
+						if (!wsResult.ok) {
+							return `❌ ${wsResult.error}`
+						}
+						workspaceRoot = wsResult.value
+					}
+
+					// Remove worktree set
+					const result = await removeWorktreeSet({
+						workspaceRoot,
+						branch: args.branch,
+						log,
+					})
+
+					// Format summary
+					const summary = [`✅ Worktree set removal complete`, ``]
+
+					if (result.removedCount > 0) {
+						summary.push(`✅ Removed ${result.removedCount} worktree(s)`)
+					}
+
+					if (result.failureCount > 0) {
+						summary.push(`❌ Failed to remove ${result.failureCount} worktree(s)`)
+					}
+
+					if (result.errors.length > 0) {
+						summary.push(``, `⚠️  Errors:`)
+						for (const error of result.errors) {
+							summary.push(`  - ${error}`)
+						}
+					}
+
+					if (result.removedCount === 0 && result.failureCount === 0) {
+						summary.push(`ℹ️  No worktrees found at ${result.featurePath}`)
+					}
+
+					return summary.join("\n")
+				},
+			}),
+
+			worktree_set_list: tool({
+				description:
+					"List all existing multi-repo worktree sets in the workspace. Shows which repositories are included in each feature set.",
+				args: {
+					workspace: tool.schema
+						.string()
+						.optional()
+						.describe("Workspace root directory (auto-detected if not provided)"),
+				},
+				async execute(args, _toolCtx) {
+					// Resolve workspace root
+					let workspaceRoot: string
+					if (args.workspace) {
+						workspaceRoot = args.workspace
+					} else {
+						const wsResult = await findWorkspaceRoot(directory)
+						if (!wsResult.ok) {
+							return `❌ ${wsResult.error}`
+						}
+						workspaceRoot = wsResult.value
+					}
+
+					// List worktree sets
+					const sets = await listWorktreeSets(workspaceRoot)
+
+					// Format output
+					if (sets.length === 0) {
+						return `ℹ️  No worktree sets found in ${workspaceRoot}`
+					}
+
+					const summary = [`📋 Worktree sets in ${workspaceRoot}:`, ``]
+
+					for (const set of sets) {
+						summary.push(`🌿 ${set.name}`)
+						summary.push(`   Repos: ${set.repos.join(", ")}`)
+						summary.push(`   Path: ${set.path}`)
+						summary.push(``)
+					}
+
+					return summary.join("\n")
 				},
 			}),
 		},

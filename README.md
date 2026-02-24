@@ -1,157 +1,187 @@
-# opencode-worktree
+# Multi-Repo Worktree Management
 
-> Git worktrees that spawn their own terminal. Zero-friction isolation for AI-driven development.
+> Internal tool for managing git worktrees across multiple repositories simultaneously.
 
-An [OpenCode](https://github.com/sst/opencode) plugin that creates isolated git worktrees—where each worktree automatically opens its own terminal with OpenCode running inside. No manual setup, no context switching, no cleanup work.
+Batch-create isolated git worktrees across selected repos for feature work that spans multiple repositories. All worktrees share the same branch name and live under a single feature directory, giving you (and OpenCode) access to all repos at once.
 
-## Why This Exists
+## Quick Start
 
-You already know you can create git worktrees manually. Or use OpenCode Desktop's UI. So why this plugin?
+```bash
+# Interactive mode - pick repos with checkboxes
+bun run src/cli/worktree-sets.ts create
 
-Manual worktrees require setup: create the worktree, open a terminal, navigate to it, start OpenCode. OpenCode Desktop gives you worktrees, but locks you into the GUI workflow. Each approach has friction.
-
-This plugin eliminates that friction. When the AI calls `worktree_create`, your terminal spawns automatically, OpenCode is already running, and files are synchronized. When it calls `worktree_delete`, changes commit automatically and the worktree cleans itself up. It's the difference between having a tool and having a workflow.
-
-Works great standalone, but pairs especially well with **tmux** for seamless window management. When running inside tmux, worktrees spawn as new windows instead of separate terminal apps—keeping everything organized in a single terminal session with zero external window overhead.
-
-## When to Use This
-
-| Approach | Best For | Tradeoffs |
-|----------|----------|-----------|
-| **Manual git worktree** | One-off experiments, full control | Manual setup, no auto-cleanup, context switching |
-| **OpenCode Desktop UI** | Visual workflow, integrated experience | Tied to desktop app, less automation |
-| **This plugin** | AI-driven workflows, automation, CLI-first users | Adds plugin dependency to your project |
-
-If you prefer manual control or work exclusively in OpenCode Desktop, you may not need this. **But if you want AI agents to seamlessly create and manage isolated development sessions—complete with automatic terminal spawning and state cleanup—this is what you're looking for.**
-
-## How It Works
-
-```mermaid
-flowchart LR
-    A[Create Worktree] --> B{Terminal Spawns}
-    B --> C[OpenCode Running]
-    C --> D[Work in Isolation]
-    D --> E[Delete Worktree]
-    E --> F{Auto-commit & Cleanup}
-    F --> G[Session Ends]
+# Non-interactive mode
+bun run src/cli/worktree-sets.ts create \
+  --branch feat-SAR-1234 \
+  --repos platform-service,findings-service,awesome_project \
+  --yes
 ```
-
-1. **Create** - AI calls `worktree_create("feature/dark-mode")`
-2. **Terminal spawns** - New window opens with OpenCode at `~/.local/share/opencode/worktree/<project-id>/feature/dark-mode`
-3. **Work** - AI experiments in complete isolation
-4. **Delete** - AI calls `worktree_delete("reason")`
-5. **Cleanup** - Changes commit automatically, git worktree removed
-
-Worktrees are stored in `~/.local/share/opencode/worktree/<project-id>/<branch>/` outside your repository.
 
 ## Installation
 
-Install via [OCX](https://github.com/kdcokenny/ocx), the package manager for OpenCode extensions:
+Add to your shell config (`~/.zshrc` or `~/.bashrc`):
 
 ```bash
-# Install OCX
-curl -fsSL https://ocx.kdco.dev/install.sh | sh
-
-# Add the registry and install
-ocx registry add https://registry.kdco.dev --name kdco
-ocx add kdco/worktree
+alias worktree-sets='bun run /Users/willbartlett/sai/tools/opencode-worktrees/src/cli/worktree-sets.ts'
 ```
 
-> **Tip:** Add `--global` to configure the registry globally instead of per-project.
+Reload: `source ~/.zshrc`
 
-Want the full experience? Install `kdco-workspace` instead—it bundles worktrees with background agents, planning tools, and notifications:
+Now you can just run: `worktree-sets create`
 
-```bash
-ocx add kdco/workspace
+## Repository Structure
+
+Your workspace should have this layout:
+
 ```
+repos/
+├── main/                    # Primary clones
+│   ├── platform-service/
+│   ├── findings-service/
+│   ├── awesome_project/
+│   └── ...
+├── feat-SAR-1234/           # Worktree set for feature
+│   ├── platform-service/
+│   ├── findings-service/
+│   └── awesome_project/
+└── fix-BUG-5678/            # Another worktree set
+    ├── platform-service/
+    └── findings-service/
+```
+
+Each feature directory contains worktrees for selected repos, all on the same branch.
 
 ## Usage
 
-The plugin adds two tools:
+### Create a Worktree Set
 
-| Tool | Purpose |
-|------|---------|
-| `worktree_create(branch, baseBranch?)` | Create a new git worktree for isolated development. A new terminal spawns with OpenCode ready. |
-| `worktree_delete(reason)` | Delete the current worktree. Changes commit automatically before removal. |
-
-### Creating a Worktree
-
-```yaml
-worktree_create:
-  branch: "feature/dark-mode"
-  baseBranch: "main"  # optional, defaults to HEAD
+**Interactive mode** (recommended):
+```bash
+worktree-sets create
 ```
 
-When called, this:
-1. Creates git worktree at `~/.local/share/opencode/worktree/<project-id>/feature/dark-mode`
-2. Syncs files based on `.opencode/worktree.jsonc` config
-3. Runs post-create hooks (e.g., `pnpm install`)
-4. Opens a new terminal with OpenCode running
+This will prompt you for:
+1. Branch name (e.g., `feat-SAR-1234`)
+2. Base branch (default: `HEAD`)
+3. Preset selection (if you have saved presets) or manual repo selection
+4. Multi-select checkbox to pick repos
+5. Confirmation before creation
 
-### Deleting a Worktree
-
-```yaml
-worktree_delete:
-  reason: "Feature complete, merging to main"
+**Non-interactive mode**:
+```bash
+worktree-sets create \
+  --branch feat-SAR-1234 \
+  --repos platform-service,findings-service,awesome_project \
+  --workspace ~/repos \
+  --yes
 ```
 
-When called, this:
-1. Runs pre-delete hooks (e.g., `docker compose down`)
-2. Commits all changes with snapshot message
-3. Removes git worktree with `--force`
-4. Cleans up session state
+**Flags**:
+- `-b, --branch <name>` — Branch name (required)
+- `--repos <list>` — Comma-separated repo names
+- `--preset <name>` — Use a saved preset instead of --repos
+- `--base <branch>` — Base branch (default: HEAD)
+- `-w, --workspace <path>` — Workspace root (default: auto-detect from CWD)
+- `-y, --yes` — Skip confirmations
+- `--no-hooks` — Skip postCreate hooks from `.opencode/worktree.jsonc`
 
-## Platform Support
+### Remove a Worktree Set
 
-The plugin detects your terminal automatically:
+**Interactive**:
+```bash
+worktree-sets remove
+```
 
-| Platform | Terminals Supported |
-|----------|---------------------|
-| **macOS** | Ghostty, iTerm2, Kitty, WezTerm, Alacritty, Warp, Terminal.app |
-| **Linux** | Kitty, WezTerm, Alacritty, Ghostty, Foot, GNOME Terminal, Konsole, XFCE4 Terminal, xterm |
-| **Windows** | Windows Terminal (wt.exe), cmd.exe fallback |
-| **tmux** | **Creates new tmux window** (priority detection on all platforms) |
-| **WSL** | Windows Terminal via wt.exe interop |
+**Non-interactive**:
+```bash
+worktree-sets remove --branch feat-SAR-1234 --yes
+```
 
-### Detection Priority
+This removes ALL worktrees in the feature directory and deletes the feature directory itself.
 
-1. **tmux** - **Priority detection on all platforms** - Creates new tmux windows instead of spawning separate terminal applications. This keeps all worktrees organized in a single terminal session with native tmux window management and zero external window overhead.
-2. **WSL** - Uses Windows Terminal for Linux subsystem
-3. **Environment vars** - Checks `TERM_PROGRAM`, `KITTY_WINDOW_ID`, `GHOSTTY_RESOURCES_DIR`, etc.
-4. **Fallback** - System defaults (Terminal.app, xterm, cmd.exe)
+### List All Worktree Sets
+
+```bash
+worktree-sets list
+```
+
+Shows all existing worktree sets with their repos.
+
+### Presets (Save Frequently-Used Repo Groups)
+
+**Save a preset**:
+```bash
+worktree-sets preset save \
+  --name backend \
+  --repos platform-service,findings-service,auth-service
+```
+
+**List presets**:
+```bash
+worktree-sets preset list
+```
+
+**Use a preset**:
+```bash
+worktree-sets create --branch feat-SAR-1234 --preset backend --yes
+```
+
+Presets are saved to `.worktree-sets.jsonc` in your workspace root.
+
+## Examples
+
+### Common Workflow
+
+```bash
+# 1. Create worktree set for multi-repo feature
+cd ~/repos/main/platform-service
+worktree-sets create
+
+# Interactive prompts:
+# Branch name: feat-SAR-1234
+# Base branch: main
+# Select repos: [x] platform-service, [x] findings-service, [ ] auth-service
+# Confirm: Yes
+
+# 2. Work on the feature
+cd ~/repos/feat-SAR-1234
+opencode  # Opens with all selected repos visible
+
+# 3. When done, remove the set
+cd ~/repos
+worktree-sets remove --branch feat-SAR-1234 --yes
+```
+
+### Using Presets for Common Combinations
+
+```bash
+# Save common repo groups
+worktree-sets preset save --name backend --repos platform-service,findings-service,auth-service
+worktree-sets preset save --name frontend --repos ui-components,web-app
+worktree-sets preset save --name data --repos data-utils,backend-utils,licence_tools
+
+# Create sets quickly
+worktree-sets create --branch feat-SAR-1234 --preset backend --yes
+worktree-sets create --branch feat-SAR-5678 --preset frontend --yes
+```
+
+### Branch Names with Slashes
+
+Branch names like `feature/dark-mode` are supported. The directory name will be sanitized to `feature-dark-mode` while git keeps the original branch name:
+
+```bash
+worktree-sets create --branch feature/dark-mode --repos ui-components --yes
+
+# Creates: ~/repos/feature-dark-mode/ui-components/
+# Git branch: feature/dark-mode
+```
 
 ## Configuration
 
-Auto-creates `.opencode/worktree.jsonc` on first use:
+### Per-Repo Hooks
 
-```jsonc
-{
-  "$schema": "https://registry.kdco.dev/schemas/worktree.json",
+Each repo can have its own `.opencode/worktree.jsonc` for file sync and hooks:
 
-  "sync": {
-    // Files to copy from main worktree
-    "copyFiles": [],
-
-    // Directories to symlink
-    "symlinkDirs": [],
-
-    // Patterns to exclude
-    "exclude": []
-  },
-
-  "hooks": {
-    // Run after creation
-    "postCreate": [],
-
-    // Run before deletion
-    "preDelete": []
-  }
-}
-```
-
-### Common Configurations
-
-**Node.js project:**
 ```jsonc
 {
   "sync": {
@@ -159,88 +189,130 @@ Auto-creates `.opencode/worktree.jsonc` on first use:
     "symlinkDirs": ["node_modules"]
   },
   "hooks": {
-    "postCreate": ["pnpm install"]
-  }
-}
-```
-
-**Docker-based project:**
-```jsonc
-{
-  "sync": {
-    "copyFiles": [".env"]
-  },
-  "hooks": {
-    "postCreate": ["docker compose up -d"],
+    "postCreate": ["pnpm install"],
     "preDelete": ["docker compose down"]
   }
 }
 ```
 
-## FAQ
+During multi-repo set creation, each repo's config is loaded and applied.
 
-### Why not just use git worktree manually?
+### Workspace Presets
 
-Manual worktrees require manual setup: `git worktree add`, opening a terminal, navigating to it, starting OpenCode. Each step is friction. This plugin gives you a single command that handles everything end-to-end, complete with automatic file synchronization and lifecycle hooks.
+The `.worktree-sets.jsonc` file in your workspace root stores presets:
 
-### Does this work with OpenCode Desktop?
+```jsonc
+{
+  "presets": {
+    "backend": ["platform-service", "findings-service", "auth-service"],
+    "frontend": ["ui-components", "web-app", "design-system"],
+    "data": ["data-utils", "backend-utils", "licence_tools"]
+  }
+}
+```
 
-Worktrees created with this plugin work fine in OpenCode Desktop, but you lose the automatic terminal spawning. The plugin's value is in CLI-first workflows and AI automation—if you prefer Desktop exclusively, you may not need this.
+## How It Works
 
-### What happens if I forget to delete the worktree?
+1. **Discovery**: Scans `main/` directory for git repositories (checks for `.git` directory)
+2. **Creation**: For each selected repo:
+   - Creates git worktree at `{workspace}/{sanitized-branch}/{repo-name}`
+   - If branch exists: checks out existing branch
+   - If branch doesn't exist: creates new branch from base
+   - Loads `.opencode/worktree.jsonc` from main repo
+   - Copies files (e.g., `.env`)
+   - Symlinks directories (e.g., `node_modules`)
+   - Runs postCreate hooks (e.g., `pnpm install`)
+3. **Continue-on-error**: If one repo fails, others still get created (failures are reported at the end)
+4. **Auto-launch**: Opens OpenCode in the feature directory (all repos visible)
+5. **Removal**: Runs preDelete hooks → removes all worktrees → deletes feature directory
 
-Changes remain in `~/.local/share/opencode/worktree/<project-id>/<branch>`. The branch exists in git. You can manually check out or delete it later. The plugin doesn't force cleanup—it's just the convenient default path.
+## Troubleshooting
 
-### Can I have multiple worktrees simultaneously?
+### "Workspace root not found"
 
-Yes. Each gets its own terminal and OpenCode session. They're fully independent.
+The CLI looks for a parent directory containing a `main/` subdirectory. If you're not inside a workspace, use `--workspace`:
 
-### Does this break my existing git workflow?
+```bash
+worktree-sets create --workspace ~/repos --branch feat-123 --repos repo-a --yes
+```
 
-No. It uses standard git worktrees. `git worktree list` shows them. Branches merge normally.
+### "Repository not found: repo-x"
 
-### Why spawn a new terminal instead of reusing the current one?
+The repo doesn't exist in `main/` or isn't a git repository. Check:
+```bash
+ls ~/repos/main/
+# Verify repo-x exists and has a .git directory
+```
 
-Isolation. You can close the worktree session without affecting your main workflow. If the AI breaks something, your original terminal remains untouched.
+### Branch already exists in some repos
 
-## Limitations
+The CLI handles this gracefully:
+- If branch exists: checks it out into the worktree
+- If branch doesn't exist: creates it from base branch
 
-### Security
+Each repo is handled independently.
 
-- Branch names validated against git ref rules and shell metacharacters
-- File sync paths validated to prevent directory traversal
-- Hook commands run with user privileges in worktree directory
+### Partial failures
 
-### Terminal Spawning
+If some repos fail during creation, the CLI will:
+- Create worktrees for repos that succeed
+- Report all failures with error details
+- Still launch OpenCode if ANY repo succeeded
 
-- Ghostty on macOS uses inline commands to avoid permission dialogs
-- Kitty tab support requires `allow_remote_control` config (falls back to window)
-- Some terminals don't support tabs; opens new OS window instead
+You can then fix the issues and manually add the failed repos, or remove the set and try again.
 
-## Manual Installation
+## CLI Reference
 
-Copy [`src/`](./src) to `.opencode/plugin/`. You lose OCX's dependency management and automatic updates.
+```
+USAGE:
+  worktree-sets <subcommand> [options]
 
-**Requirements:**
-- Manually install `jsonc-parser`
-- Manual updates via re-copying
+SUBCOMMANDS:
+  create       Create a new worktree set
+  remove       Remove an existing worktree set
+  list         List all worktree sets
+  preset save  Save a repository selection as a preset
+  preset list  List all saved presets
 
-## Part of the OCX Ecosystem
+CREATE OPTIONS:
+  -b, --branch <name>       Branch name (required for non-interactive)
+  --repos <repos>           Comma-separated repo names
+  --preset <name>           Use a saved preset
+  --base <branch>           Base branch (default: HEAD)
+  -w, --workspace <path>    Workspace root (default: auto-detect)
+  -y, --yes                 Skip confirmations
+  --no-hooks                Skip postCreate hooks
 
-From the [KDCO Registry](https://github.com/kdcokenny/ocx/tree/main/registry/src/kdco). Combine with:
+REMOVE OPTIONS:
+  -b, --branch <name>       Branch name (required for non-interactive)
+  -w, --workspace <path>    Workspace root (default: auto-detect)
+  -y, --yes                 Skip confirmations
 
-- [opencode-workspace](https://github.com/kdcokenny/opencode-workspace) - Structured planning with rule injection
-- [opencode-background-agents](https://github.com/kdcokenny/opencode-background-agents) - Async delegation with persistent outputs
-- [opencode-notify](https://github.com/kdcokenny/opencode-notify) - Native OS notifications
+PRESET SAVE OPTIONS:
+  --name <name>             Preset name
+  --repos <repos>           Comma-separated repo names
+  -w, --workspace <path>    Workspace root (default: auto-detect)
 
-## Acknowledgments
+EXAMPLES:
+  # Interactive creation
+  worktree-sets create
 
-Inspired by [opencode-worktree-session](https://github.com/felixAnhalt/opencode-worktree-session) by Felix Anhalt.
+  # Non-interactive creation
+  worktree-sets create -b feat-SAR-1234 --repos platform-service,findings-service --yes
 
-## Disclaimer
+  # Using a preset
+  worktree-sets create -b feat-SAR-1234 --preset backend --yes
 
-This project is not built by the OpenCode team and is not affiliated with [OpenCode](https://github.com/sst/opencode) in any way.
+  # Remove a set
+  worktree-sets remove -b feat-SAR-1234 --yes
 
-## License
+  # List all sets
+  worktree-sets list
 
-MIT
+  # Save a preset
+  worktree-sets preset save --name backend --repos platform-service,findings-service
+```
+
+---
+
+**Note**: This tool also includes an OpenCode plugin that provides single-repo worktree functionality with automatic terminal spawning. The plugin exposes `worktree_create`, `worktree_delete`, `worktree_set_create`, `worktree_set_delete`, and `worktree_set_list` tools for AI-driven workflows. See [AGENTS.md](./AGENTS.md) for plugin documentation and code style guidelines.
